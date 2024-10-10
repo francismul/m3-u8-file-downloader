@@ -1,6 +1,8 @@
 
+import logging
 import re
 import m3u8
+
 import asyncio
 import aiohttp
 import aiofiles
@@ -10,87 +12,141 @@ from datetime import datetime
 from tqdm.asyncio import tqdm
 
 
-class M3U8Downloader:
+logging.basicConfig(level=logging.DEBUG)
 
-    def __init__(self, url, base_dir: Path, filename: str = 'final'):
+
+class M3U8Downloader:
+    """
+    Class to download and merge segments from an M3U8 playlist.
+
+    Attributes:
+        url (str): The URL of the M3U8 playlist.
+        base_dir (Path): The base directory for storing downloaded files.
+        folder (Path): Directory where all the files, including segments and the final merged file, will be saved.
+        segments_dir (Path): Directory for storing individual video segments.
+        final_file (Path): The path for the final merged video file.
+        segments_queue (asyncio.Queue): A queue to manage segment download tasks.
+        allowed_extensions (tuple): Allowed file extensions for segments.
+    """
+
+    def __init__(self, url: str, base_dir: Path, filename: str = 'final'):
+        """
+        Initializes the M3U8Downloader object.
+
+        Args:
+            url (str): The M3U8 playlist URL.
+            base_dir (Path): Base directory to store the downloaded files.
+            filename (str, optional): Name for the final merged file. Defaults to 'final'.
+        """
         self.base_dir = base_dir
         self.url = url
-
-        self.folder = self.base_dir / f'{filename}'
+        self.folder = self.base_dir / filename
         self.folder.mkdir(exist_ok=True)
-
         self.segments_dir = self.folder / 'segments'
         self.segments_dir.mkdir(exist_ok=True)
-
         self.final_file = self.folder / f'{filename}.ts'
-
         self.segments_queue = asyncio.Queue()
-
         self.allowed_extensions = ('.ts',)
 
     @staticmethod
-    def generate_unique_filename(file_path: Path):
+    def generate_unique_filename(file_path: Path) -> Path:
+        """
+        Generates a unique filename by appending a timestamp to avoid overwriting.
+
+        Args:
+            file_path (Path): Original file path.
+
+        Returns:
+            Path: New file path with a timestamp appended.
+        """
         timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-        file_path = file_path.with_stem(f'{file_path.stem}_{timestamp}')
-        return file_path
+        return file_path.with_stem(f'{file_path.stem}_{timestamp}')
 
     @staticmethod
-    def natural_sort_key(char: str):
+    def natural_sort_key(char: str) -> list:
+        """
+        Generates a key for sorting filenames naturally (e.g., 1, 2, 10 instead of 1, 10, 2).
+
+        Args:
+            char (str): The string to be sorted.
+
+        Returns:
+            list: A list of strings and integers for natural sorting.
+        """
         return [int(text) if text.isdigit() else text.lower() for text in re.split(r'(\d+)', char)]
 
-    async def __generate_segments(self):
+    async def __generate_segments(self) -> None:
+        """
+        Generates a list of segments from the M3U8 playlist and adds them to the segments queue.
+        """
         playlist = m3u8.load(self.url)
-        mylist = [x for x in playlist.data['segments']]
-        for index, x in enumerate(mylist):
-            segment = {**x, 'id': index}
+        for index, segment in enumerate(playlist.data['segments']):
+            segment['id'] = index
             await self.segments_queue.put(segment)
 
-    async def __download_segment(self, session: aiohttp.ClientSession, task, retries=5):
+    async def __download_segment(self, session: aiohttp.ClientSession, task: dict, retries: int = 5) -> None:
+        """
+        Downloads a single segment with retries upon failure.
+
+        Args:
+            session (aiohttp.ClientSession): The active aiohttp session for making requests.
+            task (dict): A dictionary containing the segment id and URL.
+            retries (int, optional): Number of retry attempts for failed downloads. Defaults to 5.
+        """
         task_id, url = task['id'], task['uri']
         filename = self.segments_dir / f'segment{task_id:04d}.ts'
+        pbar = tqdm(desc=filename.stem, total=None, unit='B',
+                    unit_scale=True, dynamic_ncols=True, ascii=True, colour="#ff0000")
+
         for attempt in range(retries):
             try:
                 async with session.get(url) as response:
                     response.raise_for_status()
-                    pbar = tqdm(desc=filename.stem, total=9e9, unit='B',
-                                unit_scale=True, dynamic_ncols=True, ascii=True, colour="#ff0000")
                     async with aiofiles.open(filename, 'wb') as f:
                         async for data in response.content.iter_any():
                             await f.write(data)
                             pbar.update(len(data))
-                    pbar.close()
                 break  # Success, no need to retry
-            except aiohttp.ClientPayloadError as e:
-                print(f"Payload error on attempt {attempt + 1} for {url}: {e}")
             except aiohttp.ClientError as e:
-                print(f"Client error on attempt {attempt + 1} for {url}: {e}")
-            except Exception as e:
-                print(
-                    f"Unexpected error on attempt {attempt + 1} for {url}: {e}")
-            await asyncio.sleep(2)  # Wait before retrying
+                logging.error(f"Error on attempt {attempt + 1} for {url}: {e}")
+                await asyncio.sleep(2)  # Wait before retrying
+        pbar.close()
 
-    async def __worker(self, session: aiohttp.ClientSession, semaphore: asyncio.Semaphore):
+    async def __worker(self, session: aiohttp.ClientSession, semaphore: asyncio.Semaphore) -> None:
+        """
+        Worker coroutine to download segments concurrently.
+
+        Args:
+            session (aiohttp.ClientSession): The active aiohttp session.
+            semaphore (asyncio.Semaphore): Semaphore to limit concurrent workers.
+        """
         while not self.segments_queue.empty():
             task = await self.segments_queue.get()
             async with semaphore:  # Ensure concurrency limit
                 await self.__download_segment(session, task)
             self.segments_queue.task_done()
 
-    async def __download_segments(self):
+    async def __download_segments(self) -> None:
+        """
+        Manages the downloading of all segments from the M3U8 playlist.
+        """
         await self.__generate_segments()
         semaphore = asyncio.Semaphore(10)  # Limit to 10 concurrent workers
         async with aiohttp.ClientSession() as session:
-            # Create multiple workers to download segments concurrently
             tasks = [self.__worker(session, semaphore) for _ in range(10)]
             await asyncio.gather(*tasks)
 
-    async def __merge_segments(self):
+    async def __merge_segments(self) -> None:
+        """
+        Merges all downloaded segments into a single file.
+        """
         segment_files = sorted(self.segments_dir.glob(
-            '*.ts'), key=lambda f: self.natural_sort_key(f.name))
+            '*.ts'), key=self.natural_sort_key)
         total_size = sum(file.stat().st_size for file in segment_files)
         self.final_file = self.generate_unique_filename(self.final_file)
         pbar = tqdm(total=total_size, unit='B', unit_scale=True,
-                    desc="Merging Segments",  ascii=True, colour="#ff0000")
+                    desc="Merging Segments", ascii=True, colour="#ff0000")
+
         async with aiofiles.open(self.final_file, 'wb') as f:
             for file in segment_files:
                 async with aiofiles.open(file, 'rb') as segment:
@@ -102,12 +158,19 @@ class M3U8Downloader:
                         pbar.update(len(chunk))
         pbar.close()
 
-    async def __clean_up(self):
+    async def __clean_up(self) -> None:
+        """
+        Cleans up the segments directory by deleting the segment files and removing the directory.
+        """
         for f in self.segments_dir.iterdir():
             await asyncio.to_thread(f.unlink)
-        # await asyncio.to_thread(self.segments_dir.rmdir)
+        # Remove the segments directory
+        await asyncio.to_thread(self.segments_dir.rmdir)
 
-    async def run(self):
+    async def run(self) -> None:
+        """
+        Main method to download and merge the segments, and then clean up temporary files.
+        """
         try:
             await self.__download_segments()
             await self.__merge_segments()
@@ -117,7 +180,9 @@ class M3U8Downloader:
 
 if __name__ == '__main__':
     folder = Path(__file__).resolve().parent
-    url = input("Enter the m3u8 url: ")
-
-    downloader = M3U8Downloader(url, folder)
-    asyncio.run(downloader.run())
+    try:
+        url = input("Enter the m3u8 url: ")
+        downloader = M3U8Downloader(url, folder)
+        asyncio.run(downloader.run())
+    except KeyboardInterrupt:
+        logging.info("Exiting... Download interrupted by user.")
